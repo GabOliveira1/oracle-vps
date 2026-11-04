@@ -1,0 +1,76 @@
+name: Criar VPS Oracle ARM
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # a cada 30 minutos (ajuste se quiser)
+  workflow_dispatch:          # botão "Run workflow" para testar na hora
+
+permissions:
+  contents: read
+  actions: write
+  issues: write
+
+concurrency:
+  group: oracle-arm
+  cancel-in-progress: false
+
+jobs:
+  tentar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      NOME: ${{ vars.NOME || 'servidor-n8n' }}
+      OCPUS: ${{ vars.OCPUS || '2' }}
+      MEMORIA_GB: ${{ vars.MEMORIA_GB || '12' }}
+      DISCO_GB: ${{ vars.DISCO_GB || '100' }}
+      SUBNET_NOME: ${{ vars.SUBNET_NOME || 'public subnet-Gabriel' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Instalar OCI CLI
+        run: pip install -q -r requirements.txt
+
+      - name: Configurar credenciais
+        env:
+          OCI_USER: ${{ secrets.OCI_USER }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY: ${{ secrets.OCI_TENANCY }}
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_KEY: ${{ secrets.OCI_KEY }}
+          SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s\n' "$OCI_KEY" > ~/.oci/key.pem
+          chmod 600 ~/.oci/key.pem
+          {
+            echo "[DEFAULT]"
+            echo "user=$OCI_USER"
+            echo "fingerprint=$OCI_FINGERPRINT"
+            echo "tenancy=$OCI_TENANCY"
+            echo "region=$OCI_REGION"
+            echo "key_file=$HOME/.oci/key.pem"
+          } > ~/.oci/config
+          chmod 600 ~/.oci/config
+          printf '%s\n' "$SSH_PUBLIC_KEY" > ~/oracle.pub
+
+      - name: Tentar criar a VPS
+        id: tentar
+        run: bash scripts/oracle-arm-once.sh
+
+      - name: Avisar e desligar o agendamento
+        if: steps.tentar.outputs.resultado == 'criado' || steps.tentar.outputs.resultado == 'existe'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh issue create \
+            --title "VPS Oracle criada: ${NOME}" \
+            --body "A instância **${NOME}** existe/foi criada (${OCPUS} OCPU / ${MEMORIA_GB} GB). Veja o IP público no console da Oracle. O agendamento foi desligado." || true
+          gh workflow disable "${{ github.workflow }}"
