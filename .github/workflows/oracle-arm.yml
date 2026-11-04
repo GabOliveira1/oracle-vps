@@ -30,8 +30,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Instalar OCI CLI
-        run: pip install -q oci-cli
+      - name: Instalar OCI CLI (rápido, com uv)
+        run: |
+          pip install -q uv
+          uv pip install --system -q oci-cli
 
       - name: Configurar credenciais
         env:
