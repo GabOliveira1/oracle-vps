@@ -2,8 +2,8 @@ name: Criar VPS Oracle ARM
 
 on:
   schedule:
-    - cron: "*/30 * * * *"   # a cada 30 minutos
-  workflow_dispatch:          # botão "Run workflow" para testar na hora
+    - cron: "7 */5 * * *"    # inicia uma rodada a cada 5 horas (cada rodada dura até ~5h)
+  workflow_dispatch:          # botão "Run workflow" para começar na hora
 
 permissions:
   contents: read
@@ -17,7 +17,7 @@ concurrency:
 jobs:
   tentar:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 320
     env:
       OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
       NOME: ${{ vars.NOME || 'servidor-n8n' }}
@@ -77,6 +77,7 @@ jobs:
           CONFIG="$HOME/.oci/config"
 
           resultado() { echo "resultado=$1" >> "${GITHUB_OUTPUT:-/dev/null}"; }
+          RESULT=""
           log() { echo "[$(date -u '+%d/%m %H:%M:%S') UTC] $*"; }
 
           [ -s "$SSH_PUB" ] || { log "ERRO: chave pública SSH vazia (secret SSH_PUBLIC_KEY)."; exit 1; }
@@ -89,13 +90,6 @@ jobs:
             log "ERRO ao ler a availability domain (confira os secrets da API key):"; cat /tmp/err | head -n 15; exit 1
           fi
 
-          # Não cria duplicado
-          existentes=$(oci compute instance list --compartment-id "$TENANCY" --display-name "$NOME" \
-              --query "length(data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
-              --raw-output 2>/dev/null)
-          if [ -n "$existentes" ] && [ "$existentes" != "null" ] && [ "$existentes" -gt 0 ] 2>/dev/null; then
-            log "Já existe a instância '$NOME'. Nada a fazer."; resultado existe; exit 0
-          fi
 
           SUBNET=$(oci network subnet list --compartment-id "$TENANCY" --all \
                 --query "data[?\"display-name\"=='$SUBNET_NOME'].id | [0]" --raw-output 2>/dev/null)
@@ -107,32 +101,46 @@ jobs:
                 --query 'data[0].id' --raw-output 2>/dev/null)
           [ -n "$IMAGEM" ] && [ "$IMAGEM" != "null" ] || { log "ERRO: não achei a imagem Ubuntu 24.04 ARM."; exit 1; }
 
-          log "Tentando criar $SHAPE ($OCPUS OCPU / $MEMORIA_GB GB / $DISCO_GB GB) em $AD..."
-          saida=$(oci compute instance launch \
-              --availability-domain "$AD" \
-              --compartment-id "$TENANCY" \
-              --shape "$SHAPE" \
-              --shape-config "{\"ocpus\": $OCPUS, \"memoryInGBs\": $MEMORIA_GB}" \
-              --image-id "$IMAGEM" \
-              --subnet-id "$SUBNET" \
-              --assign-public-ip true \
-              --boot-volume-size-in-gbs "$DISCO_GB" \
-              --ssh-authorized-keys-file "$SSH_PUB" \
-              --display-name "$NOME" 2>&1)
-
-          if echo "$saida" | grep -q '"lifecycle-state"'; then
-            log "SUCESSO! Instância '$NOME' criada."; resultado criado; exit 0
-          elif echo "$saida" | grep -qi 'capacity'; then
-            log "Sem capacidade agora. Próxima tentativa no próximo agendamento."; resultado sem_capacidade; exit 0
-          elif echo "$saida" | grep -qi 'TooManyRequests'; then
-            log "Muitas requisições. Tenta de novo no próximo agendamento."; resultado muitas_requisicoes; exit 0
-          elif echo "$saida" | grep -qi 'LimitExceeded'; then
-            log "ERRO: limite da conta excedido. Diminua OCPUS/MEMORIA_GB/DISCO_GB."; exit 1
-          elif echo "$saida" | grep -qi 'NotAuthenticated'; then
-            log "ERRO: API key inválida. Confira os secrets."; exit 1
-          else
-            log "ERRO inesperado:"; echo "$saida" | head -n 20; exit 1
-          fi
+          FIM=$(( $(date +%s) + 5*3600 - 600 ))   # roda por ~4h50 e encerra antes do limite
+          tentativa=0
+          while [ "$(date +%s)" -lt "$FIM" ]; do
+            tentativa=$((tentativa+1))
+            existentes=$(oci compute instance list --compartment-id "$TENANCY" --display-name "$NOME" \
+                --query "length(data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" \
+                --raw-output 2>/dev/null)
+            if [ -n "$existentes" ] && [ "$existentes" != "null" ] && [ "$existentes" -gt 0 ] 2>/dev/null; then
+              log "Já existe a instância '$NOME'."; resultado existe; exit 0
+            fi
+            log "Tentando criar $SHAPE ($OCPUS OCPU / $MEMORIA_GB GB / $DISCO_GB GB) em $AD..."
+            saida=$(oci compute instance launch \
+                --availability-domain "$AD" \
+                --compartment-id "$TENANCY" \
+                --shape "$SHAPE" \
+                --shape-config "{\"ocpus\": $OCPUS, \"memoryInGBs\": $MEMORIA_GB}" \
+                --image-id "$IMAGEM" \
+                --subnet-id "$SUBNET" \
+                --assign-public-ip true \
+                --boot-volume-size-in-gbs "$DISCO_GB" \
+                --ssh-authorized-keys-file "$SSH_PUB" \
+                --display-name "$NOME" 2>&1)
+            if echo "$saida" | grep -q '"lifecycle-state"'; then
+              log "SUCESSO na tentativa $tentativa! Instância '$NOME' criada."; resultado criado; exit 0
+            elif echo "$saida" | grep -qi 'capacity'; then
+              log "Tentativa $tentativa: sem capacidade."; espera=60
+            elif echo "$saida" | grep -qi 'TooManyRequests'; then
+              log "Tentativa $tentativa: muitas requisições, esperando 5 min."; espera=300
+            elif echo "$saida" | grep -qi 'LimitExceeded'; then
+              log "ERRO: limite da conta excedido. Diminua OCPUS/MEMORIA_GB/DISCO_GB."; exit 1
+            elif echo "$saida" | grep -qi 'NotAuthenticated'; then
+              log "ERRO: API key inválida. Confira os secrets."; exit 1
+            else
+              log "Tentativa $tentativa: erro inesperado:"; echo "$saida" | head -n 10; espera=120
+            fi
+            sleep $((espera + RANDOM % 30))
+          done
+          log "Fim desta rodada ($tentativa tentativas). A próxima começa no próximo agendamento."
+          resultado sem_capacidade
+          exit 0
 
       - name: Avisar e desligar o agendamento
         if: steps.tentar.outputs.resultado == 'criado' || steps.tentar.outputs.resultado == 'existe'
